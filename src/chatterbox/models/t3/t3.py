@@ -433,7 +433,7 @@ class T3(nn.Module):
         if initial_speech_tokens is None:
             initial_speech_tokens = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
 
-        embeds, _ = self.prepare_input_embeds(
+        embeds, len_cond = self.prepare_input_embeds(
             t3_cond=t3_cond,
             text_tokens=text_tokens,
             speech_tokens=initial_speech_tokens,
@@ -447,7 +447,7 @@ class T3(nn.Module):
                 alignment_stream_analyzer = AlignmentStreamAnalyzer(
                     self.tfmr,
                     None,
-                    text_tokens_slice=(embeds.shape[1], embeds.shape[1] + text_tokens.size(-1)),
+                    text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
                     alignment_layer_idx=9,
                     eos_idx=self.hp.stop_speech_token,
                 )
