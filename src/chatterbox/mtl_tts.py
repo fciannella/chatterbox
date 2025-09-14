@@ -299,3 +299,97 @@ class ChatterboxMultilingualTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def generate_stream(
+        self,
+        text,
+        language_id,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        repetition_penalty=2.0,
+        min_p=0.05,
+        top_p=1.0,
+    ):
+        """Stream audio chunks while synthesizing speech.
+
+        This method mirrors :meth:`generate` but yields waveform chunks as soon
+        as they are produced. It returns a Python generator yielding tensors of
+        shape ``(1, N)`` where ``N`` varies per chunk.
+        """
+
+        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. "
+                f"Supported languages: {supported_langs}"
+            )
+
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(
+            text, language_id=language_id.lower() if language_id else None
+        ).to(self.device)
+        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        stream = self.t3.inference_stream(
+            t3_cond=self.conds.t3,
+            text_tokens=text_tokens,
+            max_new_tokens=1000,
+            temperature=temperature,
+            cfg_weight=cfg_weight,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            top_p=top_p,
+        )
+
+        speech_tokens = []
+        cache_source = None
+        prev_len = 0
+        for tok in stream:
+            speech_tokens.append(tok.item())
+            st = torch.tensor(speech_tokens, dtype=torch.long, device=self.device).unsqueeze(0)
+            wav, cache_source = self.s3gen.inference(
+                speech_tokens=st,
+                ref_dict=self.conds.gen,
+                cache_source=cache_source,
+                finalize=False,
+            )
+            wav = wav.squeeze(0).detach().cpu().numpy()
+            chunk = wav[prev_len:]
+            prev_len = wav.shape[0]
+            if len(chunk) > 0:
+                chunk = self.watermarker.apply_watermark(chunk, sample_rate=self.sr)
+                yield torch.from_numpy(chunk).unsqueeze(0)
+
+        # Finalize to flush remaining tokens
+        st = torch.tensor(speech_tokens, dtype=torch.long, device=self.device).unsqueeze(0)
+        wav, _ = self.s3gen.inference(
+            speech_tokens=st,
+            ref_dict=self.conds.gen,
+            finalize=True,
+        )
+        wav = wav.squeeze(0).detach().cpu().numpy()
+        chunk = wav[prev_len:]
+        if len(chunk) > 0:
+            chunk = self.watermarker.apply_watermark(chunk, sample_rate=self.sr)
+            yield torch.from_numpy(chunk).unsqueeze(0)
+
